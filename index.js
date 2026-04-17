@@ -11,6 +11,17 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const PORT = process.env.PORT || 3000;
 
+console.log("ENV CHECK:", {
+  hasTelegramToken: !!TELEGRAM_TOKEN,
+  hasOpenAiKey: !!OPENAI_KEY,
+  hasSupabaseUrl: !!SUPABASE_URL,
+  hasSupabaseSecretKey: !!SUPABASE_SECRET_KEY
+});
+
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SECRET_KEY in Railway Variables");
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
 app.get("/", (req, res) => {
@@ -41,28 +52,6 @@ function extractResponseText(data) {
   }
 
   return null;
-}
-
-async function getEmbedding(text) {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "text-embedding-3-small",
-      input: text
-    })
-  });
-
-  const data = await response.json();
-
-  if (data.error) {
-    throw new Error(`Embedding error: ${data.error.message}`);
-  }
-
-  return data.data[0].embedding;
 }
 
 async function getOrCreateUser(telegramUserId, telegramChatId, displayName) {
@@ -116,6 +105,28 @@ async function saveMessage(userId, role, text) {
   }
 
   return data;
+}
+
+async function getEmbedding(text) {
+  const response = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: text
+    })
+  });
+
+  const data = await response.json();
+
+  if (data.error) {
+    throw new Error(`Embedding error: ${data.error.message}`);
+  }
+
+  return data.data[0].embedding;
 }
 
 async function saveConversationChunk(userId, messageId, content) {
