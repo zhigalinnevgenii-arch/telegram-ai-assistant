@@ -31,7 +31,7 @@ app.post("/webhook", async (req, res) => {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        input: `Ты личный ассистент. Отвечай естественно, по-человечески, кратко и по делу.\n\nСообщение пользователя: ${userText}`
+        input: `Ты личный ассистент. Отвечай естественно, кратко и по делу.\n\nСообщение пользователя: ${userText}`
       })
     });
 
@@ -62,8 +62,6 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 });
-
-const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
