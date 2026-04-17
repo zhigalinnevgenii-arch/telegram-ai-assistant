@@ -12,6 +12,32 @@ app.get("/", (req, res) => {
   res.status(200).send("Assistant server is running");
 });
 
+function extractResponseText(data) {
+  if (data.output_text && typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  if (Array.isArray(data.output)) {
+    const texts = [];
+
+    for (const item of data.output) {
+      if (item.type === "message" && Array.isArray(item.content)) {
+        for (const content of item.content) {
+          if (content.type === "output_text" && content.text) {
+            texts.push(content.text);
+          }
+        }
+      }
+    }
+
+    if (texts.length > 0) {
+      return texts.join("\n").trim();
+    }
+  }
+
+  return null;
+}
+
 app.post("/webhook", async (req, res) => {
   try {
     const message = req.body.message;
@@ -31,18 +57,22 @@ app.post("/webhook", async (req, res) => {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        input: `Ты личный ассистент. Отвечай естественно, кратко и по делу.\n\nСообщение пользователя: ${userText}`
+        instructions: "Ты личный ассистент. Отвечай естественно, кратко и по делу.",
+        input: userText
       })
     });
 
     const data = await aiResponse.json();
+    console.log("OpenAI response:", JSON.stringify(data, null, 2));
 
-    let reply = "Не удалось получить ответ.";
+    let reply = extractResponseText(data);
 
-    if (data.output_text) {
-      reply = data.output_text;
-    } else if (data.error?.message) {
+    if (!reply && data.error?.message) {
       reply = `Ошибка OpenAI: ${data.error.message}`;
+    }
+
+    if (!reply) {
+      reply = "Ответ пришел, но текст не удалось распознать.";
     }
 
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
