@@ -1,12 +1,17 @@
 import express from "express";
 import fetch from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json());
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_KEY = process.env.OPENAI_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const PORT = process.env.PORT || 3000;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
 app.get("/", (req, res) => {
   res.status(200).send("Assistant server is running");
@@ -38,6 +43,130 @@ function extractResponseText(data) {
   return null;
 }
 
+async function getEmbedding(text) {
+  const response = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: text
+    })
+  });
+
+  const data = await response.json();
+
+  if (data.error) {
+    throw new Error(`Embedding error: ${data.error.message}`);
+  }
+
+  return data.data[0].embedding;
+}
+
+async function getOrCreateUser(telegramUserId, telegramChatId, displayName) {
+  const { data: existingUser, error: selectError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("telegram_user_id", String(telegramUserId))
+    .limit(1)
+    .maybeSingle();
+
+  if (selectError) {
+    throw selectError;
+  }
+
+  if (existingUser) {
+    return existingUser;
+  }
+
+  const { data: newUser, error: insertError } = await supabase
+    .from("users")
+    .insert({
+      telegram_user_id: String(telegramUserId),
+      telegram_chat_id: String(telegramChatId),
+      display_name: displayName || null,
+      assistant_profile_summary: null,
+      last_response_id: null
+    })
+    .select()
+    .single();
+
+  if (insertError) {
+    throw insertError;
+  }
+
+  return newUser;
+}
+
+async function saveMessage(userId, role, text) {
+  const { data, error } = await supabase
+    .from("messages")
+    .insert({
+      user_id: userId,
+      role,
+      text
+    })
+    .select()
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  return data;
+}
+
+async function saveConversationChunk(userId, messageId, content) {
+  const embedding = await getEmbedding(content);
+
+  const { error } = await supabase
+    .from("conversation_chunks")
+    .insert({
+      user_id: userId,
+      message_id: messageId,
+      content,
+      embedding
+    });
+
+  if (error) {
+    throw error;
+  }
+}
+
+async function getRecentMessages(userId, limit = 10) {
+  const { data, error } = await supabase
+    .from("messages")
+    .select("role, text, created_at")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data || []).reverse();
+}
+
+function buildConversationContext(messages, currentUserText) {
+  const history = messages
+    .map((msg) => `${msg.role === "user" ? "Пользователь" : "Ассистент"}: ${msg.text}`)
+    .join("\n");
+
+  return `
+Ты личный ассистент пользователя.
+Отвечай естественно, по-человечески, кратко и по делу.
+
+История недавнего диалога:
+${history || "История пока пуста."}
+
+Новое сообщение пользователя:
+${currentUserText}
+  `.trim();
+}
+
 app.post("/webhook", async (req, res) => {
   try {
     const message = req.body.message;
@@ -47,7 +176,20 @@ app.post("/webhook", async (req, res) => {
     }
 
     const chatId = message.chat.id;
+    const telegramUserId = message.from.id;
+    const displayName =
+      [message.from.first_name, message.from.last_name].filter(Boolean).join(" ") ||
+      message.from.username ||
+      "User";
     const userText = message.text;
+
+    const user = await getOrCreateUser(telegramUserId, chatId, displayName);
+
+    const savedUserMessage = await saveMessage(user.id, "user", userText);
+    await saveConversationChunk(user.id, savedUserMessage.id, userText);
+
+    const recentMessages = await getRecentMessages(user.id, 10);
+    const prompt = buildConversationContext(recentMessages, userText);
 
     const aiResponse = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -57,14 +199,11 @@ app.post("/webhook", async (req, res) => {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        instructions: "Ты личный ассистент. Отвечай естественно, кратко и по делу.",
-        input: userText
+        input: prompt
       })
     });
 
     const data = await aiResponse.json();
-    console.log("OpenAI response:", JSON.stringify(data, null, 2));
-
     let reply = extractResponseText(data);
 
     if (!reply && data.error?.message) {
@@ -74,6 +213,9 @@ app.post("/webhook", async (req, res) => {
     if (!reply) {
       reply = "Ответ пришел, но текст не удалось распознать.";
     }
+
+    const savedAssistantMessage = await saveMessage(user.id, "assistant", reply);
+    await saveConversationChunk(user.id, savedAssistantMessage.id, reply);
 
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       method: "POST",
@@ -89,6 +231,25 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   } catch (error) {
     console.error("Webhook error:", error);
+
+    try {
+      const chatId = req.body?.message?.chat?.id;
+      if (chatId) {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: "Произошла ошибка при обработке сообщения."
+          })
+        });
+      }
+    } catch (telegramError) {
+      console.error("Telegram fallback error:", telegramError);
+    }
+
     return res.sendStatus(200);
   }
 });
