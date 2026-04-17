@@ -18,8 +18,8 @@ console.log("ENV CHECK:", {
   hasSupabaseSecretKey: !!SUPABASE_SECRET_KEY
 });
 
-if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
-  throw new Error("Missing SUPABASE_URL or SUPABASE_SECRET_KEY in Railway Variables");
+if (!TELEGRAM_TOKEN || !OPENAI_KEY || !SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  throw new Error("Missing required Railway Variables");
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
@@ -52,6 +52,28 @@ function extractResponseText(data) {
   }
 
   return null;
+}
+
+async function getEmbedding(text) {
+  const response = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: text
+    })
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || data.error) {
+    throw new Error(`Embedding error: ${data?.error?.message || "Unknown embedding error"}`);
+  }
+
+  return data.data[0].embedding;
 }
 
 async function getOrCreateUser(telegramUserId, telegramChatId, displayName) {
@@ -107,28 +129,6 @@ async function saveMessage(userId, role, text) {
   return data;
 }
 
-async function getEmbedding(text) {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "text-embedding-3-small",
-      input: text
-    })
-  });
-
-  const data = await response.json();
-
-  if (data.error) {
-    throw new Error(`Embedding error: ${data.error.message}`);
-  }
-
-  return data.data[0].embedding;
-}
-
 async function saveConversationChunk(userId, messageId, content) {
   const embedding = await getEmbedding(content);
 
@@ -161,17 +161,43 @@ async function getRecentMessages(userId, limit = 10) {
   return (data || []).reverse();
 }
 
-function buildConversationContext(messages, currentUserText) {
+async function searchRelevantChunks(userId, text) {
+  const embedding = await getEmbedding(text);
+
+  const { data, error } = await supabase.rpc("match_conversation_chunks", {
+    query_embedding: embedding,
+    match_user_id: userId,
+    match_count: 5
+  });
+
+  if (error) {
+    console.error("Search error:", error);
+    return [];
+  }
+
+  return data || [];
+}
+
+function buildConversationContext(messages, relevantChunks, currentUserText) {
   const history = messages
     .map((msg) => `${msg.role === "user" ? "Пользователь" : "Ассистент"}: ${msg.text}`)
+    .join("\n");
+
+  const memory = relevantChunks
+    .map((chunk) => `- ${chunk.content}`)
     .join("\n");
 
   return `
 Ты личный ассистент пользователя.
 Отвечай естественно, по-человечески, кратко и по делу.
+Учитывай и недавний диалог, и важные релевантные фрагменты из прошлой переписки.
+Не говори, что ты не помнишь, если информация уже есть в контексте ниже.
 
-История недавнего диалога:
-${history || "История пока пуста."}
+Недавний диалог:
+${history || "нет"}
+
+Релевантные воспоминания из прошлой переписки:
+${memory || "нет"}
 
 Новое сообщение пользователя:
 ${currentUserText}
@@ -200,7 +226,13 @@ app.post("/webhook", async (req, res) => {
     await saveConversationChunk(user.id, savedUserMessage.id, userText);
 
     const recentMessages = await getRecentMessages(user.id, 10);
-    const prompt = buildConversationContext(recentMessages, userText);
+    const relevantChunks = await searchRelevantChunks(user.id, userText);
+
+    const prompt = buildConversationContext(
+      recentMessages,
+      relevantChunks,
+      userText
+    );
 
     const aiResponse = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
